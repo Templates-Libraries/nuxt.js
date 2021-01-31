@@ -4,6 +4,7 @@ import { format } from 'util'
 import fs from 'fs-extra'
 import consola from 'consola'
 import { TARGETS, urlJoin } from '@nuxt/utils'
+import { parsePath, withoutTrailingSlash } from 'ufo'
 import devalue from '@nuxt/devalue'
 import { createBundleRenderer } from 'vue-server-renderer'
 import BaseRenderer from './base'
@@ -20,32 +21,41 @@ export default class SSRRenderer extends BaseRenderer {
     }
   }
 
-  renderScripts (renderContext) {
-    const scripts = renderContext.renderScripts()
-    const { render: { crossorigin } } = this.options
-    if (!crossorigin) {
-      return scripts
+  addAttrs (tags, referenceTag, referenceAttr) {
+    const reference = referenceTag ? `<${referenceTag}` : referenceAttr
+    if (!reference) {
+      return tags
     }
-    return scripts.replace(
-      /<script/g,
-      `<script crossorigin="${crossorigin}"`
-    )
+
+    const { render: { crossorigin } } = this.options
+    if (crossorigin) {
+      tags = tags.replace(
+        new RegExp(reference, 'g'),
+        `${reference} crossorigin="${crossorigin}"`
+      )
+    }
+
+    return tags
+  }
+
+  renderResourceHints (renderContext) {
+    return this.addAttrs(renderContext.renderResourceHints(), null, 'rel="preload"')
+  }
+
+  renderScripts (renderContext) {
+    let renderedScripts = this.addAttrs(renderContext.renderScripts(), 'script')
+    if (this.options.render.asyncScripts) {
+      renderedScripts = renderedScripts.replace(/defer>/g, 'defer async>')
+    }
+    return renderedScripts
+  }
+
+  renderStyles (renderContext) {
+    return this.addAttrs(renderContext.renderStyles(), 'link')
   }
 
   getPreloadFiles (renderContext) {
     return renderContext.getPreloadFiles()
-  }
-
-  renderResourceHints (renderContext) {
-    const resourceHints = renderContext.renderResourceHints()
-    const { render: { crossorigin } } = this.options
-    if (!crossorigin) {
-      return resourceHints
-    }
-    return resourceHints.replace(
-      /rel="preload"/g,
-      `rel="preload" crossorigin="${crossorigin}"`
-    )
   }
 
   createRenderer () {
@@ -114,11 +124,22 @@ export default class SSRRenderer extends BaseRenderer {
 
     // Inject head meta
     // (this is unset when features.meta is false in server template)
-    const meta = renderContext.meta && renderContext.meta.inject()
+    const meta = renderContext.meta && renderContext.meta.inject({
+      isSSR: renderContext.nuxt.serverRendered,
+      ln: this.options.dev
+    })
+
     if (meta) {
-      HEAD += meta.title.text() +
-        meta.meta.text() +
-        meta.link.text() +
+      HEAD += meta.title.text() + meta.meta.text()
+    }
+
+    // Add <base href=""> meta if router base specified
+    if (this.options._routerBaseSpecified) {
+      HEAD += `<base href="${this.options.router.base}">`
+    }
+
+    if (meta) {
+      HEAD += meta.link.text() +
         meta.style.text() +
         meta.script.text() +
         meta.noscript.text()
@@ -127,26 +148,23 @@ export default class SSRRenderer extends BaseRenderer {
     // Check if we need to inject scripts and state
     const shouldInjectScripts = this.options.render.injectScripts !== false
 
-    // Add <base href=""> meta if router base specified
-    if (this.options._routerBaseSpecified) {
-      HEAD += `<base href="${this.options.router.base}">`
-    }
-
     // Inject resource hints
     if (this.options.render.resourceHints && shouldInjectScripts) {
       HEAD += this.renderResourceHints(renderContext)
     }
 
     // Inject styles
-    HEAD += renderContext.renderStyles()
+    HEAD += this.renderStyles(renderContext)
 
     if (meta) {
+      const prependInjectorOptions = { pbody: true }
+
       const BODY_PREPEND =
-        meta.meta.text({ pbody: true }) +
-        meta.link.text({ pbody: true }) +
-        meta.style.text({ pbody: true }) +
-        meta.script.text({ pbody: true }) +
-        meta.noscript.text({ pbody: true })
+        meta.meta.text(prependInjectorOptions) +
+        meta.link.text(prependInjectorOptions) +
+        meta.style.text(prependInjectorOptions) +
+        meta.script.text(prependInjectorOptions) +
+        meta.noscript.text(prependInjectorOptions)
 
       if (BODY_PREPEND) {
         APP = `${BODY_PREPEND}${APP}`
@@ -166,8 +184,10 @@ export default class SSRRenderer extends BaseRenderer {
       const { data, fetch, mutations, ...state } = nuxt
 
       // Initial state
-      const nuxtStaticScript = `window.__NUXT_STATIC__='${staticAssetsBase}';`
-      const stateScript = `window.${this.serverContext.globals.context}=${devalue(state)};`
+      const stateScript = `window.${this.serverContext.globals.context}=${devalue({
+        staticAssetsBase,
+        ...state
+      })};`
 
       // Make chunk for initial state > 10 KB
       const stateScriptKb = (stateScript.length * 4 /* utf8 */) / 100
@@ -175,20 +195,34 @@ export default class SSRRenderer extends BaseRenderer {
         const statePath = urlJoin(url, 'state.js')
         const stateUrl = urlJoin(staticAssetsBase, statePath)
         staticAssets.push({ path: statePath, src: stateScript })
-        APP += `<script defer>${nuxtStaticScript}</script>`
-        APP += `<script defer src="${staticAssetsBase}${statePath}"></script>`
+        if (this.options.render.asyncScripts) {
+          APP += `<script defer async src="${stateUrl}"></script>`
+        } else {
+          APP += `<script defer src="${stateUrl}"></script>`
+        }
         preloadScripts.push(stateUrl)
       } else {
-        APP += `<script defer>${nuxtStaticScript}${stateScript}</script>`
+        APP += `<script>${stateScript}</script>`
       }
 
-      // Page level payload.js (async loaded for CSR)
-      const payloadPath = urlJoin(url, 'payload.js')
-      const payloadUrl = urlJoin(staticAssetsBase, payloadPath)
-      const routePath = (url.replace(/\/+$/, '') || '/').split('?')[0] // remove trailing slah and query params
-      const payloadScript = `__NUXT_JSONP__("${routePath}", ${devalue({ data, fetch, mutations })});`
-      staticAssets.push({ path: payloadPath, src: payloadScript })
-      preloadScripts.push(payloadUrl)
+      // Save payload only if no error or redirection were made
+      if (!renderContext.nuxt.error && !renderContext.redirected) {
+        // Page level payload.js (async loaded for CSR)
+        const payloadPath = urlJoin(url, 'payload.js')
+        const payloadUrl = urlJoin(staticAssetsBase, payloadPath)
+        let routePath = parsePath(url).pathname // remove query params
+        if (!this.options.router.trailingSlash) {
+          routePath = withoutTrailingSlash(routePath) || '/'
+        }
+        const payloadScript = `__NUXT_JSONP__("${routePath}", ${devalue({ data, fetch, mutations })});`
+        staticAssets.push({ path: payloadPath, src: payloadScript })
+        preloadScripts.push(payloadUrl)
+        // Add manifest preload
+        if (this.options.generate.manifest) {
+          const manifestUrl = urlJoin(staticAssetsBase, 'manifest.js')
+          preloadScripts.push(manifestUrl)
+        }
+      }
 
       // Preload links
       for (const href of preloadScripts) {
@@ -234,17 +268,19 @@ export default class SSRRenderer extends BaseRenderer {
     }
 
     if (meta) {
+      const appendInjectorOptions = { body: true }
+
       // Append body scripts
-      APP += meta.meta.text({ body: true })
-      APP += meta.link.text({ body: true })
-      APP += meta.style.text({ body: true })
-      APP += meta.script.text({ body: true })
-      APP += meta.noscript.text({ body: true })
+      APP += meta.meta.text(appendInjectorOptions)
+      APP += meta.link.text(appendInjectorOptions)
+      APP += meta.style.text(appendInjectorOptions)
+      APP += meta.script.text(appendInjectorOptions)
+      APP += meta.noscript.text(appendInjectorOptions)
     }
 
     // Template params
     const templateParams = {
-      HTML_ATTRS: meta ? meta.htmlAttrs.text(true /* addSrrAttribute */) : '',
+      HTML_ATTRS: meta ? meta.htmlAttrs.text(renderContext.nuxt.serverRendered /* addSrrAttribute */) : '',
       HEAD_ATTRS: meta ? meta.headAttrs.text() : '',
       BODY_ATTRS: meta ? meta.bodyAttrs.text() : '',
       HEAD,

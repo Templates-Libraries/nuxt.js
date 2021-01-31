@@ -16,7 +16,11 @@ module.exports = {
   rules: {
     'no-console': 'error',
     'no-debugger': 'error',
-    quotes: ['error', 'single', { avoidEscape: true, allowTemplateLiterals: true }]
+    'no-template-curly-in-string': 0,
+    quotes: ['error', 'single', { avoidEscape: true, allowTemplateLiterals: true }],
+    // https://github.com/babel/babel-eslint/issues/799
+    'template-curly-spacing': 0,
+    indent: ['error', 2, { SwitchCase: 1, ignoredNodes: ['TemplateLiteral'] }]
   },
   overrides: [{
     files: ['test/fixtures/*/.nuxt*/**'],
@@ -67,6 +71,22 @@ module.exports = {
     files: ['test/fixtures/*/.nuxt*/**/nuxt-link.client.js'],
     rules: {
       'standard/no-callback-literal': 'off'
+    }
+  }, {
+    files: ['**/*.ts'],
+    env: { browser: true, es6: true, node: true },
+    extends: [
+      '@nuxtjs/eslint-config-typescript'
+    ],
+    globals: { Atomics: 'readonly', SharedArrayBuffer: 'readonly' },
+    parser: '@typescript-eslint/parser',
+    parserOptions: {
+      ecmaFeatures: { jsx: true },
+      ecmaVersion: 2018,
+      sourceType: 'module'
+    },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 0
     }
   }]
 }

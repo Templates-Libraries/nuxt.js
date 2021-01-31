@@ -1,5 +1,6 @@
 import { stringify } from 'querystring'
 import Vue from 'vue'
+import { normalizeURL } from 'ufo'
 <% if (fetch.server) { %>import fetch from 'node-fetch'<% } %>
 <% if (features.middleware) { %>import middleware from './middleware.js'<% } %>
 import {
@@ -24,13 +25,31 @@ if (!Vue.__nuxt__fetch__mixin__) {
 }
 <% } %>
 
+<% if (isDev) { %>
+if (!Vue.__original_use__) {
+  Vue.__original_use__ = Vue.use
+  Vue.__install_times__ = 0
+  Vue.use = function (plugin, ...args) {
+    plugin.__nuxt_external_installed__ = Vue._installedPlugins.includes(plugin)
+    return Vue.__original_use__(plugin, ...args)
+  }
+}
+if (Vue.__install_times__ === 2) {
+  Vue.__install_times__ = 0
+  Vue._installedPlugins = Vue._installedPlugins.filter(plugin => {
+    return plugin.__nuxt_external_installed__ === true
+  })
+}
+Vue.__install_times__++
+<% } %>
+
 // Component: <NuxtLink>
 Vue.component(NuxtLink.name, NuxtLink)
 <% if (features.componentAliases) { %>Vue.component('NLink', NuxtLink)<% } %>
 
 <% if (fetch.server) { %>if (!global.fetch) { global.fetch = fetch }<% } %>
 
-const noopApp = () => new Vue({ render: h => h('div') })
+const noopApp = () => new Vue({ render: h => h('div', { domProps: { id: '<%= globals.id %>' } }) })
 
 function urlJoin () {
   return Array.prototype.slice.call(arguments).join('/').replace(/\/+/g, '/')
@@ -45,17 +64,18 @@ const createNext = ssrContext => (opts) => {
   }
   opts.query = stringify(opts.query)
   opts.path = opts.path + (opts.query ? '?' + opts.query : '')
-  const routerBase = '<%= router.base %>'
+  const $config = ssrContext.runtimeConfig || {}
+  const routerBase = ($config.app && $config.app.basePath) || '<%= router.base %>'
   if (!opts.path.startsWith('http') && (routerBase !== '/' && !opts.path.startsWith(routerBase))) {
     opts.path = urlJoin(routerBase, opts.path)
   }
   // Avoid loop redirect
-  if (opts.path === ssrContext.url) {
+  if (decodeURI(opts.path) === decodeURI(ssrContext.url)) {
     ssrContext.redirected = false
     return
   }
   ssrContext.res.writeHead(opts.status, {
-    Location: opts.path
+    Location: normalizeURL(opts.path)
   })
   ssrContext.res.end()
 }
@@ -72,14 +92,21 @@ export default async (ssrContext) => {
   // Used for beforeNuxtRender({ Components, nuxtState })
   ssrContext.beforeRenderFns = []
   // Nuxt object (window.{{globals.context}}, defaults to window.__NUXT__)
-  ssrContext.nuxt = { <% if (features.layouts) { %>layout: 'default', <% } %>data: [], <% if (features.fetch) { %>fetch: [], <% } %>error: null<%= (store ? ', state: null' : '') %>, serverRendered: true, routePath: '' }
+  ssrContext.nuxt = { <% if (features.layouts) { %>layout: 'default', <% } %>data: [], <% if (features.fetch) { %>fetch: {}, <% } %>error: null<%= (store ? ', state: null' : '') %>, serverRendered: true, routePath: '' }
+  <% if (features.fetch) { %>
+    ssrContext.fetchCounters = {}
+  <% } %>
+
   // Remove query from url is static target
-  if (process.static && ssrContext.url) {
+  <% if (isFullStatic) { %>
+  if (ssrContext.url) {
     ssrContext.url = ssrContext.url.split('?')[0]
   }
-
+  <% } %>
+  // Public runtime config
+  ssrContext.nuxt.config = ssrContext.runtimeConfig.public
   // Create the app definition and the instance (created for each request)
-  const { app, router<%= (store ? ', store' : '') %> } = await createApp(ssrContext)
+  const { app, router<%= (store ? ', store' : '') %> } = await createApp(ssrContext, { ...ssrContext.runtimeConfig.public, ...ssrContext.runtimeConfig.private })
   const _app = new Vue(app)
   // Add ssr route path to nuxt context so we can account for page navigation between ssr and csr
   ssrContext.nuxt.routePath = app.context.route.path

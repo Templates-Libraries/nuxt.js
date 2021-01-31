@@ -36,12 +36,21 @@ export default ({ options, nuxt, renderRoute, resources }) => async function nux
       res.statusCode = context.nuxt.error.statusCode || 500
     }
 
+    if (options.render.csp && cspScriptSrcHashes) {
+      const { allowedSources, policies } = options.render.csp
+      const isReportOnly = !!options.render.csp.reportOnly
+      const cspHeader = isReportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
+
+      res.setHeader(cspHeader, getCspString({ cspScriptSrcHashes, allowedSources, policies, isReportOnly }))
+    }
+
     // Add ETag header
     if (!error && options.render.etag) {
       const { hash } = options.render.etag
       const etag = hash ? hash(html, options.render.etag) : generateETag(html, options.render.etag)
       if (fresh(req.headers, { etag })) {
         res.statusCode = 304
+        await nuxt.callHook('render:beforeResponse', url, result, context)
         res.end()
         await nuxt.callHook('render:routeDone', url, result, context)
         return
@@ -68,18 +77,11 @@ export default ({ options, nuxt, renderRoute, resources }) => async function nux
       }
     }
 
-    if (options.render.csp && cspScriptSrcHashes) {
-      const { allowedSources, policies } = options.render.csp
-      const isReportOnly = !!options.render.csp.reportOnly
-      const cspHeader = isReportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy'
-
-      res.setHeader(cspHeader, getCspString({ cspScriptSrcHashes, allowedSources, policies, isDev: options.dev, isReportOnly }))
-    }
-
     // Send response
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
     res.setHeader('Accept-Ranges', 'none') // #3870
     res.setHeader('Content-Length', Buffer.byteLength(html))
+    await nuxt.callHook('render:beforeResponse', url, result, context)
     res.end(html, 'utf8')
     await nuxt.callHook('render:routeDone', url, result, context)
     return html
@@ -124,9 +126,9 @@ const defaultPushAssets = (preloadFiles, shouldPush, publicPath, options) => {
   return links
 }
 
-const getCspString = ({ cspScriptSrcHashes, allowedSources, policies, isDev, isReportOnly }) => {
+const getCspString = ({ cspScriptSrcHashes, allowedSources, policies, isReportOnly }) => {
   const joinedHashes = cspScriptSrcHashes.join(' ')
-  const baseCspStr = `script-src 'self'${isDev ? ' \'unsafe-eval\'' : ''} ${joinedHashes}`
+  const baseCspStr = `script-src 'self' ${joinedHashes}`
   const policyObjectAvailable = typeof policies === 'object' && policies !== null && !Array.isArray(policies)
 
   if (Array.isArray(allowedSources) && allowedSources.length) {

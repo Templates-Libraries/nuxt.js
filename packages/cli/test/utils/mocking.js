@@ -12,13 +12,16 @@ jest.mock('../../src/imports', () => {
     generator: jest.fn().mockImplementation(() => ({
       Generator () {}
     })),
+    server: () => ({
+      Listener: class { listen () { } }
+    }),
     webpack: jest.fn().mockImplementation(() => ({
       BundleBuilder () {}
     }))
   }
 })
 
-export const mockGetNuxt = (options = {}, implementation) => {
+export const mockGetNuxt = (options = {}, implementation = {}) => {
   Command.prototype.getNuxt = jest.fn().mockImplementationOnce(() => {
     return Object.assign({
       hook: jest.fn(),

@@ -16,7 +16,8 @@ jest.mock('std-env', () => ({
 
 jest.mock('@nuxt/utils', () => ({
   ...jest.requireActual('@nuxt/utils'),
-  getMainModule: () => ({ paths: ['/var/nuxt/node_modules'] })
+  getMainModule: () => ({ paths: ['/var/nuxt/node_modules'] }),
+  getPKG: () => ({ name: 'fake' })
 }))
 
 describe('config: options', () => {
@@ -25,7 +26,14 @@ describe('config: options', () => {
     jest.spyOn(path, 'resolve').mockImplementation((...args) => args.join('/').replace(/\\+/, '/'))
     jest.spyOn(path, 'join').mockImplementation((...args) => args.join('/').replace(/\\+/, '/'))
 
-    expect(getNuxtConfig({ generate: { staticAssets: { version: 'x' } } })).toMatchSnapshot()
+    expect(getNuxtConfig({
+      createRequire: jest.fn(),
+      generate: {
+        staticAssets: {
+          version: 'x'
+        }
+      }
+    })).toMatchSnapshot()
 
     process.cwd.mockRestore()
     path.resolve.mockRestore()
@@ -159,6 +167,11 @@ describe('config: options', () => {
 
   test('should return fallback html when generate.fallback is string', () => {
     const { generate: { fallback } } = getNuxtConfig({ generate: { fallback: 'fallback.html' } })
+    expect(fallback).toEqual('fallback.html')
+  })
+
+  test('export should alias to generate', () => {
+    const { generate: { fallback } } = getNuxtConfig({ export: { fallback: 'fallback.html' } })
     expect(fallback).toEqual('fallback.html')
   })
 

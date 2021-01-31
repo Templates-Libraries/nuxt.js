@@ -1,20 +1,25 @@
 import path from 'path'
 import chalk from 'chalk'
 import consola from 'consola'
+import devalue from 'devalue'
 import fsExtra from 'fs-extra'
+import defu from 'defu'
 import htmlMinifier from 'html-minifier'
 import { parse } from 'node-html-parser'
 
-import { isFullStatic, flatRoutes, isString, isUrl, promisifyRoute, waitFor, TARGETS, MODES } from '@nuxt/utils'
+import { isFullStatic, flatRoutes, isString, isUrl, promisifyRoute, urlJoin, waitFor, requireModule } from '@nuxt/utils'
 
 export default class Generator {
   constructor (nuxt, builder) {
     this.nuxt = nuxt
     this.options = nuxt.options
     this.builder = builder
-    this.isFullStatic = false
 
     // Set variables
+    this.isFullStatic = isFullStatic(this.options)
+    if (this.isFullStatic) {
+      consola.info(`Full static generation activated`)
+    }
     this.staticRoutes = path.resolve(this.options.srcDir, this.options.dir.static)
     this.srcBuiltPath = path.resolve(this.options.buildDir, 'dist', 'client')
     this.distPath = this.options.generate.dir
@@ -22,31 +27,49 @@ export default class Generator {
       this.distPath,
       isUrl(this.options.build.publicPath) ? '' : this.options.build.publicPath
     )
-    this.generatedRoutes = new Set()
+    // Payloads for full static
+    if (this.isFullStatic) {
+      const { staticAssets, manifest } = this.options.generate
+      this.staticAssetsDir = path.resolve(this.distNuxtPath, staticAssets.dir, staticAssets.version)
+      this.staticAssetsBase = urlJoin(this.options.app.cdnURL || '/', this.options.generate.staticAssets.versionBase)
+      if (manifest) {
+        this.manifest = defu(manifest, {
+          routes: []
+        })
+      }
+    }
+
+    // Shared payload
+    this._payload = null
+    this.setPayload = (payload) => {
+      this._payload = defu(payload, this._payload)
+    }
   }
 
   async generate ({ build = true, init = true } = {}) {
     consola.debug('Initializing generator...')
     await this.initiate({ build, init })
 
-    // Payloads for full static
-    if (this.isFullStatic) {
-      consola.info('Full static mode activated')
-      const { staticAssets } = this.options.generate
-      this.staticAssetsDir = path.resolve(this.distNuxtPath, staticAssets.dir, staticAssets.version)
-      this.staticAssetsBase = this.options.generate.staticAssets.versionBase
-    }
-
     consola.debug('Preparing routes for generate...')
     const routes = await this.initRoutes()
 
-    consola.info('Generating pages')
+    consola.info('Generating pages' + (this.isFullStatic ? ' with full static mode' : ''))
     const errors = await this.generateRoutes(routes)
 
     await this.afterGenerate()
 
+    // Save routes manifest for full static
+    if (this.manifest) {
+      await this.nuxt.callHook('generate:manifest', this.manifest, this)
+      const manifestPath = path.join(this.staticAssetsDir, 'manifest.js')
+      await fsExtra.ensureDir(this.staticAssetsDir)
+      await fsExtra.writeFile(manifestPath, `__NUXT_JSONP__("manifest.js", ${devalue(this.manifest)})`, 'utf-8')
+      consola.success('Static manifest generated')
+    }
+
     // Done hook
     await this.nuxt.callHook('generate:done', this, errors)
+    await this.nuxt.callHook('export:done', this, { errors })
 
     return { errors }
   }
@@ -57,6 +80,7 @@ export default class Generator {
 
     // Call before hook
     await this.nuxt.callHook('generate:before', this, this.options.generate)
+    await this.nuxt.callHook('export:before', this)
 
     if (build) {
       // Add flag to set process.static
@@ -64,23 +88,13 @@ export default class Generator {
 
       // Start build process
       await this.builder.build()
-      this.isFullStatic = isFullStatic(this.options)
     } else {
       const hasBuilt = await fsExtra.exists(path.resolve(this.options.buildDir, 'dist', 'server', 'client.manifest.json'))
       if (!hasBuilt) {
-        const fullStaticArgs = isFullStatic(this.options) ? ' --target static' : ''
         throw new Error(
-          `No build files found in ${this.srcBuiltPath}.\nPlease run \`nuxt build${fullStaticArgs}\` before calling \`nuxt export\``
+          `No build files found in ${this.srcBuiltPath}.\nPlease run \`nuxt build\``
         )
       }
-      const config = this.getBuildConfig()
-      if (!config || config.target !== TARGETS.static) {
-        throw new Error(
-          `In order to use \`nuxt export\`, you need to run \`nuxt build --target static\``
-        )
-      }
-      this.isFullStatic = config.isFullStatic
-      this.options.render.ssr = config.ssr
     }
 
     // Initialize dist directory
@@ -92,7 +106,7 @@ export default class Generator {
   async initRoutes (...args) {
     // Resolve config.generate.routes promises before generating the routes
     let generateRoutes = []
-    if (this.options.mode === MODES.universal && this.options.router.mode !== 'hash') {
+    if (this.options.router.mode !== 'hash') {
       try {
         generateRoutes = await promisifyRoute(
           this.options.generate.routes || [],
@@ -105,16 +119,23 @@ export default class Generator {
     }
     let routes = []
     // Generate only index.html for router.mode = 'hash' or client-side apps
-    if (this.options.mode === MODES.spa || this.options.router.mode === 'hash') {
+    if (this.options.router.mode === 'hash') {
       routes = ['/']
     } else {
-      routes = flatRoutes(this.getAppRoutes())
+      try {
+        routes = flatRoutes(this.getAppRoutes())
+      } catch (err) {
+        // Case: where we use custom router.js
+        // https://github.com/nuxt-community/router-module/issues/83
+        routes = ['/']
+      }
     }
     routes = routes.filter(route => this.shouldGenerateRoute(route))
     routes = this.decorateWithPayloads(routes, generateRoutes)
 
     // extendRoutes hook
     await this.nuxt.callHook('generate:extendRoutes', routes)
+    await this.nuxt.callHook('export:extendRoutes', { routes })
 
     return routes
   }
@@ -130,22 +151,29 @@ export default class Generator {
 
   getBuildConfig () {
     try {
-      return require(path.join(this.options.buildDir, 'nuxt/config.json'))
+      return requireModule(path.join(this.options.buildDir, 'nuxt/config.json'))
     } catch (err) {
       return null
     }
   }
 
   getAppRoutes () {
-    return require(path.join(this.options.buildDir, 'routes.json'))
+    return requireModule(path.join(this.options.buildDir, 'routes.json'))
   }
 
   async generateRoutes (routes) {
     const errors = []
 
-    this.routes = routes
-    // Add routes to the tracked generated routes (for crawler)
-    this.routes.forEach(({ route }) => this.generatedRoutes.add(route))
+    this.routes = []
+    this.generatedRoutes = new Set()
+
+    routes.forEach(({ route, ...props }) => {
+      route = decodeURI(route)
+      this.routes.push({ route, ...props })
+      // Add routes to the tracked generated routes (for crawler)
+      this.generatedRoutes.add(route)
+    })
+
     // Start generate process
     while (this.routes.length) {
       let n = 0
@@ -223,6 +251,7 @@ export default class Generator {
 
     consola.info(`Generating output directory: ${path.basename(this.distPath)}/`)
     await this.nuxt.callHook('generate:distRemoved', this)
+    await this.nuxt.callHook('export:distRemoved', this)
 
     // Copy static and built files
     if (await fsExtra.exists(this.staticRoutes)) {
@@ -238,9 +267,10 @@ export default class Generator {
     // Add .nojekyll file to let GitHub Pages add the _nuxt/ folder
     // https://help.github.com/articles/files-that-start-with-an-underscore-are-missing/
     const nojekyllPath = path.resolve(this.distPath, '.nojekyll')
-    fsExtra.writeFile(nojekyllPath, '')
+    await fsExtra.writeFile(nojekyllPath, '')
 
     await this.nuxt.callHook('generate:distCopied', this)
+    await this.nuxt.callHook('export:distCopied', this)
   }
 
   decorateWithPayloads (routes, generateRoutes) {
@@ -265,6 +295,22 @@ export default class Generator {
     let html
     const pageErrors = []
 
+    if (this.options.router && this.options.router.trailingSlash && route[route.length - 1] !== '/') {
+      route = route + '/'
+    }
+
+    const setPayload = (_payload) => {
+      payload = defu(_payload, payload)
+    }
+
+    // Apply shared payload
+    if (this._payload) {
+      payload = defu(payload, this._payload)
+    }
+
+    await this.nuxt.callHook('generate:route', { route, setPayload })
+    await this.nuxt.callHook('export:route', { route, setPayload })
+
     try {
       const renderContext = {
         payload,
@@ -275,13 +321,22 @@ export default class Generator {
 
       // If crawler activated and called from generateRoutes()
       if (this.options.generate.crawler && this.options.render.ssr) {
+        const possibleTrailingSlash = this.options.router.trailingSlash ? '/' : ''
         parse(html).querySelectorAll('a').map((el) => {
-          const href = (el.getAttribute('href') || '').replace(/\/+$/, '').split('?')[0].split('#')[0].trim()
+          const sanitizedHref = (el.getAttribute('href') || '')
+            .replace(this.options.router.base, '/')
+            .split('?')[0]
+            .split('#')[0]
+            .replace(/\/+$/, '')
+            .trim()
 
-          if (href.startsWith('/') && !path.extname(href) && this.shouldGenerateRoute(href) && !this.generatedRoutes.has(href)) {
-            this.generatedRoutes.add(href) // add the route to the tracked list
-            this.routes.push({ route: href })
+          const foundRoute = decodeURI(sanitizedHref + possibleTrailingSlash)
+
+          if (foundRoute.startsWith('/') && !foundRoute.startsWith('//') && !path.extname(foundRoute) && this.shouldGenerateRoute(foundRoute) && !this.generatedRoutes.has(foundRoute)) {
+            this.generatedRoutes.add(foundRoute)
+            this.routes.push({ route: foundRoute })
           }
+          return null
         })
       }
 
@@ -292,8 +347,13 @@ export default class Generator {
           await fsExtra.ensureDir(path.dirname(assetPath))
           await fsExtra.writeFile(assetPath, asset.src, 'utf-8')
         }
+        // Add route to manifest (only if no error and redirect)
+        if (this.manifest && (!res.error && !res.redirected)) {
+          this.manifest.routes.push(route)
+        }
       }
 
+      // SPA fallback
       if (res.error) {
         pageErrors.push({ type: 'handled', route, error: res.error })
       }
@@ -301,10 +361,8 @@ export default class Generator {
       pageErrors.push({ type: 'unhandled', route, error: err })
       errors.push(...pageErrors)
 
-      await this.nuxt.callHook('generate:routeFailed', {
-        route,
-        errors: pageErrors
-      })
+      await this.nuxt.callHook('generate:routeFailed', { route, errors: pageErrors })
+      await this.nuxt.callHook('export:routeFailed', { route, errors: pageErrors })
       consola.error(this._formatErrors(pageErrors))
 
       return false
@@ -322,34 +380,42 @@ export default class Generator {
     let fileName
 
     if (this.options.generate.subFolders) {
-      fileName = path.join(route, path.sep, 'index.html') // /about -> /about/index.html
-      fileName = fileName === '/404/index.html' ? '/404.html' : fileName // /404 -> /404.html
+      fileName = route === '/404'
+        ? path.join(path.sep, '404.html') // /404 -> /404.html
+        : path.join(route, path.sep, 'index.html') // /about -> /about/index.html
     } else {
       const normalizedRoute = route.replace(/\/$/, '')
       fileName = route.length > 1 ? path.join(path.sep, normalizedRoute + '.html') : path.join(path.sep, 'index.html')
     }
 
     // Call hook to let user update the path & html
-    const page = { route, path: fileName, html }
+    const page = {
+      route,
+      path: fileName,
+      html,
+      exclude: false,
+      errors: pageErrors
+    }
+    page.page = page // Backward compatibility for export:page hook
     await this.nuxt.callHook('generate:page', page)
 
+    if (page.exclude) {
+      return false
+    }
     page.path = path.join(this.distPath, page.path)
 
     // Make sure the sub folders are created
     await fsExtra.mkdirp(path.dirname(page.path))
     await fsExtra.writeFile(page.path, page.html, 'utf8')
 
-    await this.nuxt.callHook('generate:routeCreated', {
-      route,
-      path: page.path,
-      errors: pageErrors
-    })
+    await this.nuxt.callHook('generate:routeCreated', { route, path: page.path, errors: pageErrors })
+    await this.nuxt.callHook('export:routeCreated', { route, path: page.path, errors: pageErrors })
 
     if (pageErrors.length) {
-      consola.error('Error generating ' + route)
+      consola.error(`Error generating route "${route}": ${pageErrors.map(e => e.error.message).join(', ')}`)
       errors.push(...pageErrors)
     } else {
-      consola.success('Generated ' + route)
+      consola.success(`Generated route "${route}"`)
     }
 
     return true

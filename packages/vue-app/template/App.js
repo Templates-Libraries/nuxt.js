@@ -1,4 +1,5 @@
 import Vue from 'vue'
+import { parsePath, withoutTrailingSlash } from 'ufo'
 <% utilsImports = [
   ...(features.asyncData || features.fetch) ? [
     'getMatchedComponentsInstances',
@@ -12,7 +13,7 @@ import Vue from 'vue'
   ]: []
 ] %>
 <% if (utilsImports.length) { %>import { <%= utilsImports.join(', ') %> } from './utils'<% } %>
-<% if (features.layouts && components.ErrorPage) { %>import NuxtError from '<%= components.ErrorPage %>'<% } %>
+import NuxtError from '<%= components.ErrorPage ? components.ErrorPage : "./components/nuxt-error.vue" %>'
 <% if (loading) { %>import NuxtLoading from '<%= (typeof loading === "string" ? loading : "./components/nuxt-loading.vue") %>'<% } %>
 <% if (buildIndicator) { %>import NuxtBuildIndicator from './components/nuxt-build-indicator'<% } %>
 <% css.forEach((c) => { %>
@@ -41,25 +42,12 @@ export default {
   render (h, props) {
     <% if (loading) { %>const loadingEl = h('NuxtLoading', { ref: 'loading' })<% } %>
     <% if (features.layouts) { %>
-    <% if (components.ErrorPage) { %>
-    if (this.nuxt.err && NuxtError) {
-      const errorLayout = (NuxtError.options || NuxtError).layout
-      if (errorLayout) {
-        this.setLayout(
-          typeof errorLayout === 'function'
-            ? errorLayout.call(NuxtError, this.context)
-            : errorLayout
-        )
-      }
-    }
-    <% } %>
     const layoutEl = h(this.layout || 'nuxt')
     const templateEl = h('div', {
       domProps: {
         id: '__layout'
       },
-
-          key: this.layoutName
+      key: this.layoutName
     }, [layoutEl])
     <% } else { %>
     const templateEl = h('nuxt')
@@ -111,7 +99,8 @@ export default {
   },
   created () {
     // Add this.$nuxt in child instances
-    Vue.prototype.<%= globals.nuxt %> = this
+    this.$root.$options.<%= globals.nuxt %> = this
+
     if (process.client) {
       // add to window so we can listen when ready
       window.<%= globals.nuxt %> = <%= (globals.nuxt !== '$nuxt' ? 'window.$nuxt = ' : '') %>this
@@ -134,7 +123,7 @@ export default {
     if (this.isPreview) {
       if (this.$store && this.$store._actions.nuxtServerInit) {
         <% if (loading) { %>this.$loading.start()<% } %>
-        await app.$store.dispatch('nuxtServerInit', this.context)
+        await this.$store.dispatch('nuxtServerInit', this.context)
       }
       await this.refresh()
       <% if (loading) { %>this.$loading.finish()<% } %>
@@ -142,11 +131,9 @@ export default {
     <% } %>
   },
   <% } %>
-  <% if (loading) { %>
   watch: {
     'nuxt.err': 'errorChanged'
   },
-  <% } %>
   <% if (features.clientOnline) { %>
   computed: {
     isOffline () {
@@ -228,18 +215,29 @@ export default {
       <% if (loading) { %>this.$loading.finish()<% } %>
       <% } %>
     },
-    <% if (loading) { %>
-    errorChanged () {
-      if (this.nuxt.err && this.$loading) {
-        if (this.$loading.fail) {
-          this.$loading.fail(this.nuxt.err)
+    <% if (splitChunks.layouts) { %>async <% } %>errorChanged () {
+      if (this.nuxt.err) {
+        <% if (loading) { %>
+        if (this.$loading) {
+          if (this.$loading.fail) {
+            this.$loading.fail(this.nuxt.err)
+          }
+          if (this.$loading.finish) {
+            this.$loading.finish()
+          }
         }
-        if (this.$loading.finish) {
-          this.$loading.finish()
+        <% } %>
+        let errorLayout = (NuxtError.options || NuxtError).layout;
+
+        if (typeof errorLayout === 'function') {
+          errorLayout = errorLayout(this.context)
         }
+        <% if (splitChunks.layouts) { %>
+        await this.loadLayout(errorLayout)
+        <% } %>
+        this.setLayout(errorLayout)
       }
     },
-    <% } %>
     <% if (features.layouts) { %>
     <% if (splitChunks.layouts) { %>
     setLayout (layout) {
@@ -298,19 +296,50 @@ export default {
     <% } /* splitChunks.layouts */ %>
     <% } /* features.layouts */ %>
     <% if (isFullStatic) { %>
+    getRouterBase() {
+      return withoutTrailingSlash(this.$router.options.base)
+    },
+    getRoutePath(route = '/') {
+      const base = this.getRouterBase()
+      if (base && route.startsWith(base)) {
+        route = route.substr(base.length)
+      }
+      let path = parsePath(route).pathname
+      <% if (!nuxtOptions.router.trailingSlash) { %>
+        path = withoutTrailingSlash(path)
+      <% } %>
+      return path || '/'
+    },
+    getStaticAssetsPath(route = '/') {
+      const { staticAssetsBase } = window.<%= globals.context %>
+
+      return urlJoin(staticAssetsBase, withoutTrailingSlash(this.getRoutePath(route)))
+    },
+    <% if (nuxtOptions.generate.manifest) { %>
+      async fetchStaticManifest() {
+      return window.__NUXT_IMPORT__('manifest.js', encodeURI(urlJoin(this.getStaticAssetsPath(), 'manifest.js')))
+    },
+    <% } %>
     setPagePayload(payload) {
       this._pagePayload = payload
-      this._payloadFetchIndex = 0
+      this._fetchCounters = {}
     },
-    async fetchPayload(route) {
-      route = (route.replace(/\/+$/, '') || '/').split('?')[0]
+    async fetchPayload(route, prefetch) {
+      <% if (nuxtOptions.generate.manifest) { %>
+      const manifest = await this.fetchStaticManifest()
+      const path = this.getRoutePath(route)
+      if (!manifest.routes.includes(path)) {
+        if (!prefetch) { this.setPagePayload(false) }
+        throw new Error(`Route ${path} is not pre-rendered`)
+      }
+      <% } %>
+      const src = urlJoin(this.getStaticAssetsPath(route), 'payload.js')
       try {
-        const src = urlJoin(window.__NUXT_STATIC__, route, 'payload.js')
-        const payload = await window.__NUXT_IMPORT__(route, src)
-        this.setPagePayload(payload)
+        const payload = await window.__NUXT_IMPORT__(decodeURI(route), encodeURI(src))
+        if (!prefetch) { this.setPagePayload(payload) }
         return payload
       } catch (err) {
-        this.setPagePayload(false)
+        if (!prefetch) { this.setPagePayload(false) }
         throw err
       }
     }

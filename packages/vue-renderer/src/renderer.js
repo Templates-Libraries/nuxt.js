@@ -1,8 +1,9 @@
 import path from 'path'
 import fs from 'fs-extra'
 import consola from 'consola'
-import template from 'lodash/template'
-import { isModernRequest, waitFor } from '@nuxt/utils'
+import { template } from 'lodash'
+import { TARGETS, isModernRequest, urlJoin, waitFor } from '@nuxt/utils'
+import { normalizeURL } from 'ufo'
 
 import SPARenderer from './renderers/spa'
 import SSRRenderer from './renderers/ssr'
@@ -27,7 +28,7 @@ export default class VueRenderer {
       serverManifest: undefined,
       ssrTemplate: undefined,
       spaTemplate: undefined,
-      errorTemplate: this.parseTemplate('Nuxt.js Internal Server Error')
+      errorTemplate: this.parseTemplate('Nuxt Internal Server Error')
     })
 
     // Default status
@@ -195,7 +196,8 @@ export default class VueRenderer {
       return
     }
 
-    if (!resources.modernManifest) {
+    const isExplicitStaticModern = options.target === TARGETS.static && options.modern
+    if (!resources.modernManifest && !isExplicitStaticModern) {
       options.modern = false
       return
     }
@@ -273,9 +275,10 @@ export default class VueRenderer {
     consola.debug(`Rendering url ${url}`)
 
     // Add url to the renderContext
-    renderContext.url = url
+    renderContext.url = normalizeURL(url)
+
     // Add target to the renderContext
-    renderContext.target = this.serverContext.nuxt.options.target
+    renderContext.target = this.options.target
 
     const { req = {}, res = {} } = renderContext
 
@@ -291,6 +294,12 @@ export default class VueRenderer {
       renderContext.modern = modernMode === 'client' || isModernRequest(req, modernMode)
     }
 
+    // Set runtime config on renderContext
+    renderContext.runtimeConfig = {
+      private: renderContext.spa ? {} : { ...this.options.privateRuntimeConfig },
+      public: { ...this.options.publicRuntimeConfig }
+    }
+
     // Call renderContext hook
     await this.serverContext.nuxt.callHook('vue-renderer:context', renderContext)
 
@@ -301,14 +310,15 @@ export default class VueRenderer {
   }
 
   get resourceMap () {
+    const publicPath = urlJoin(this.options.app.cdnURL || '/', this.options.app.assetsPath)
     return {
       clientManifest: {
         fileName: 'client.manifest.json',
-        transform: src => JSON.parse(src)
+        transform: src => Object.assign(JSON.parse(src), { publicPath })
       },
       modernManifest: {
         fileName: 'modern.manifest.json',
-        transform: src => JSON.parse(src)
+        transform: src => Object.assign(JSON.parse(src), { publicPath })
       },
       serverManifest: {
         fileName: 'server.manifest.json',
