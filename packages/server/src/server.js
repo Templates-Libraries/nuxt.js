@@ -23,7 +23,7 @@ export default class Server {
 
     this.publicPath = isUrl(this.options.build.publicPath)
       ? this.options.build._publicPath
-      : this.options.build.publicPath
+      : this.options.build.publicPath.replace(/^\.+\//, '/')
 
     // Runtime shared resources
     this.resources = {}
@@ -87,13 +87,15 @@ export default class Server {
       this.useMiddleware(createTimingMiddleware(this.options.server.timing))
     }
 
-    // For serving static/ files to /
-    const staticMiddleware = serveStatic(
-      path.resolve(this.options.srcDir, this.options.dir.static),
-      this.options.render.static
-    )
-    staticMiddleware.prefix = this.options.render.static.prefix
-    this.useMiddleware(staticMiddleware)
+    if (this.options.render.static !== false) {
+      // For serving static/ files to /
+      const staticMiddleware = serveStatic(
+        path.resolve(this.options.srcDir, this.options.dir.static),
+        this.options.render.static
+      )
+      staticMiddleware.prefix = this.options.render.static.prefix
+      this.useMiddleware(staticMiddleware)
+    }
 
     // Serve .nuxt/dist/client files only for production
     // For dev they will be served with devMiddleware
@@ -113,6 +115,12 @@ export default class Server {
       this.useMiddleware((req, res, next) => {
         if (!this.devMiddleware) {
           return next()
+        }
+        // Safari over-caches JS (breaking HMR) and the seemingly only way to turn
+        // this off in dev mode is to set Vary: * header
+        // #3828, #9034
+        if (req.url.startsWith(this.publicPath) && req.url.endsWith('.js')) {
+          res.setHeader('Vary', '*')
         }
         this.devMiddleware(req, res, next)
       })

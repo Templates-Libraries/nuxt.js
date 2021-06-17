@@ -106,7 +106,7 @@ describe('basic dev', () => {
     )
     const { cssModules, vue } = loadersOptions
     expect(cssModules.modules.localIdentName).toBe('[hash:base64:6]')
-    expect(vueLoader.use[1 /* 0 is components loader */].options).toBe(vue)
+    expect(vueLoader.options).toBe(vue)
   })
 
   test('Config: preset-env and cssnano are at then end of postcss plugins', () => {
@@ -155,9 +155,8 @@ describe('basic dev', () => {
   })
 
   test('/error should return error stack trace (Youch)', async () => {
-    await expect(nuxt.server.renderAndGetWindow(url('/error'))).rejects.toMatchObject({
-      response: { statusCode: 500 }
-    })
+    await expect(nuxt.server.renderAndGetWindow(url('/error')))
+      .rejects.toThrow('Resource was not loaded. Status: 500')
   })
 
   test('/error should return json format error (Youch)', async () => {

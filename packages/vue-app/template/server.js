@@ -1,6 +1,5 @@
-import { stringify } from 'querystring'
 import Vue from 'vue'
-import { normalizeURL } from 'ufo'
+import { joinURL, normalizeURL, withQuery } from 'ufo'
 <% if (fetch.server) { %>import fetch from 'node-fetch'<% } %>
 <% if (features.middleware) { %>import middleware from './middleware.js'<% } %>
 import {
@@ -51,10 +50,6 @@ Vue.component(NuxtLink.name, NuxtLink)
 
 const noopApp = () => new Vue({ render: h => h('div', { domProps: { id: '<%= globals.id %>' } }) })
 
-function urlJoin () {
-  return Array.prototype.slice.call(arguments).join('/').replace(/\/+/g, '/')
-}
-
 const createNext = ssrContext => (opts) => {
   // If static target, render on client-side
   ssrContext.redirected = opts
@@ -62,20 +57,19 @@ const createNext = ssrContext => (opts) => {
     ssrContext.nuxt.serverRendered = false
     return
   }
-  opts.query = stringify(opts.query)
-  opts.path = opts.path + (opts.query ? '?' + opts.query : '')
+  let fullPath = withQuery(opts.path, opts.query)
   const $config = ssrContext.runtimeConfig || {}
-  const routerBase = ($config.app && $config.app.basePath) || '<%= router.base %>'
-  if (!opts.path.startsWith('http') && (routerBase !== '/' && !opts.path.startsWith(routerBase))) {
-    opts.path = urlJoin(routerBase, opts.path)
+  const routerBase = ($config._app && $config._app.basePath) || '<%= router.base %>'
+  if (!fullPath.startsWith('http') && (routerBase !== '/' && !fullPath.startsWith(routerBase))) {
+    fullPath = joinURL(routerBase, fullPath)
   }
   // Avoid loop redirect
-  if (decodeURI(opts.path) === decodeURI(ssrContext.url)) {
+  if (decodeURI(fullPath) === decodeURI(ssrContext.url)) {
     ssrContext.redirected = false
     return
   }
   ssrContext.res.writeHead(opts.status, {
-    Location: normalizeURL(opts.path)
+    Location: normalizeURL(fullPath)
   })
   ssrContext.res.end()
 }
@@ -91,6 +85,8 @@ export default async (ssrContext) => {
   ssrContext.next = createNext(ssrContext)
   // Used for beforeNuxtRender({ Components, nuxtState })
   ssrContext.beforeRenderFns = []
+  // for beforeSerialize(nuxtState)
+  ssrContext.beforeSerializeFns = []
   // Nuxt object (window.{{globals.context}}, defaults to window.__NUXT__)
   ssrContext.nuxt = { <% if (features.layouts) { %>layout: 'default', <% } %>data: [], <% if (features.fetch) { %>fetch: {}, <% } %>error: null<%= (store ? ', state: null' : '') %>, serverRendered: true, routePath: '' }
   <% if (features.fetch) { %>
@@ -105,8 +101,11 @@ export default async (ssrContext) => {
   <% } %>
   // Public runtime config
   ssrContext.nuxt.config = ssrContext.runtimeConfig.public
+  if (ssrContext.nuxt.config._app) {
+    __webpack_public_path__ = joinURL(ssrContext.nuxt.config._app.cdnURL, ssrContext.nuxt.config._app.assetsPath)
+  }
   // Create the app definition and the instance (created for each request)
-  const { app, router<%= (store ? ', store' : '') %> } = await createApp(ssrContext, { ...ssrContext.runtimeConfig.public, ...ssrContext.runtimeConfig.private })
+  const { app, router<%= (store ? ', store' : '') %> } = await createApp(ssrContext, ssrContext.runtimeConfig.private)
   const _app = new Vue(app)
   // Add ssr route path to nuxt context so we can account for page navigation between ssr and csr
   ssrContext.nuxt.routePath = app.context.route.path
@@ -123,16 +122,21 @@ export default async (ssrContext) => {
   const beforeRender = async () => {
     // Call beforeNuxtRender() methods
     await Promise.all(ssrContext.beforeRenderFns.map(fn => promisify(fn, { Components, nuxtState: ssrContext.nuxt })))
-    <% if (store) { %>
+
     ssrContext.rendered = () => {
+      // Call beforeSerialize() hooks
+      ssrContext.beforeSerializeFns.forEach(fn => fn(ssrContext.nuxt))
+
+      <% if (store) { %>
       // Add the state from the vuex store
       ssrContext.nuxt.state = store.state
+      <% } %>
+
       <% if (isFullStatic && store) { %>
       // Stop recording store mutations
       ssrContext.unsetMutationObserver()
       <% } %>
     }
-    <% } %>
   }
 
   const renderErrorPage = async () => {
@@ -159,7 +163,7 @@ export default async (ssrContext) => {
   <% if (debug) { %>const s = Date.now()<% } %>
 
   // Components are already resolved by setContext -> getRouteData (app/utils.js)
-  const Components = getMatchedComponents(router.match(ssrContext.url))
+  const Components = getMatchedComponents(app.context.route)
 
   <% if (store) { %>
   /*
